@@ -240,42 +240,6 @@ export async function handleGetProfile(request: Request, env: Env, userId: strin
   return jsonResponse(toProfile(user, env));
 }
 
-// PUT /api/accounts/profile
-export async function handleUpdateProfile(request: Request, env: Env, userId: string): Promise<Response> {
-  const storage = new StorageService(env.DB);
-  const user = await storage.getUserById(userId);
-  if (!user) return errorResponse('User not found', 404);
-
-  let body: { name?: string; email?: string };
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse('Invalid JSON', 400);
-  }
-
-  if (typeof body.name === 'string') {
-    user.name = body.name.trim() || user.name;
-  }
-  if (typeof body.email === 'string') {
-    const normalized = body.email.trim().toLowerCase();
-    if (!normalized) return errorResponse('Email is required', 400);
-    user.email = normalized;
-  }
-  user.updatedAt = new Date().toISOString();
-
-  try {
-    await storage.saveUser(user);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-    if (msg.includes('unique') || msg.includes('constraint')) {
-      return errorResponse('Email already registered', 409);
-    }
-    throw error;
-  }
-
-  return handleGetProfile(request, env, userId);
-}
-
 // POST /api/accounts/keys
 export async function handleSetKeys(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -308,15 +272,16 @@ export async function handleSetKeys(request: Request, env: Env, userId: string):
     return errorResponse('Invalid password', 400);
   }
 
-  if (body.key) user.key = body.key;
-  if (body.encryptedPrivateKey) user.privateKey = body.encryptedPrivateKey;
-  if (body.publicKey) user.publicKey = body.publicKey;
   if (body.key && !looksLikeEncString(body.key)) {
     return errorResponse('key is not a valid encrypted string', 400);
   }
   if (body.encryptedPrivateKey && !looksLikeEncString(body.encryptedPrivateKey)) {
     return errorResponse('encryptedPrivateKey is not a valid encrypted string', 400);
   }
+
+  if (body.key) user.key = body.key;
+  if (body.encryptedPrivateKey) user.privateKey = body.encryptedPrivateKey;
+  if (body.publicKey) user.publicKey = body.publicKey;
   user.updatedAt = new Date().toISOString();
 
   await storage.saveUser(user);
@@ -526,7 +491,11 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   const email = String(body.email || body.username || '').trim().toLowerCase();
   const masterPasswordHash = String(body.masterPasswordHash || body.password || '').trim();
   const recoveryCode = normalizeRecoveryCodeInput(String(body.recoveryCode || body.twoFactorToken || body.recovery_code || ''));
-  const recoverLimitKey = `${getClientIdentifier(request)}:recover-2fa:${email || 'unknown'}`;
+  const clientIdentifier = getClientIdentifier(request);
+  if (!clientIdentifier) {
+    return errorResponse('Client IP is required', 403);
+  }
+  const recoverLimitKey = `${clientIdentifier}:recover-2fa:${email || 'unknown'}`;
 
   const recoverAttemptCheck = await rateLimit.checkLoginAttempt(recoverLimitKey);
   if (!recoverAttemptCheck.allowed) {

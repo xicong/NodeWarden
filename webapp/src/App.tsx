@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Link, Route, Switch, useLocation } from 'wouter';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowUpDown, Cloud, Lock, LogOut, Send as SendIcon, Settings as SettingsIcon, Shield, ShieldUser, Vault } from 'lucide-preact';
+import { ArrowUpDown, Cloud, Clock3, KeyRound, Lock, LogOut, Send as SendIcon, Settings as SettingsIcon, Shield, ShieldUser } from 'lucide-preact';
 import AuthViews from '@/components/AuthViews';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import ToastHost from '@/components/ToastHost';
@@ -15,6 +15,7 @@ import SecurityDevicesPage from '@/components/SecurityDevicesPage';
 import AdminPage from '@/components/AdminPage';
 import HelpPage from '@/components/HelpPage';
 import ImportPage from '@/components/ImportPage';
+import TotpCodesPage from '@/components/TotpCodesPage';
 import type { ImportAttachmentFile, ImportResultSummary } from '@/components/ImportPage';
 import {
   changeMasterPassword,
@@ -110,24 +111,27 @@ function summarizeImportResult(
   ciphers: Array<Record<string, unknown>>,
   folderCount: number
 ): ImportResultSummary {
-  const counter = new Map<string, number>();
   const typeLabel = (type: number): string => {
-    if (type === 1) return '登录';
-    if (type === 2) return '安全备注';
-    if (type === 3) return '卡片';
-    if (type === 4) return '身份';
-    if (type === 5) return 'SSH 密钥';
-    return '其他';
+    if (type === 1) return t('txt_login');
+    if (type === 2) return t('txt_secure_note');
+    if (type === 3) return t('txt_card');
+    if (type === 4) return t('txt_identity');
+    if (type === 5) return t('txt_ssh_key');
+    return t('txt_other');
   };
+  const counter = new Map<number, number>();
   for (const raw of ciphers) {
-    const t = Number(raw?.type || 1) || 1;
-    const label = typeLabel(t);
-    counter.set(label, (counter.get(label) || 0) + 1);
+    const cipherType = Number(raw?.type || 1) || 1;
+    counter.set(cipherType, (counter.get(cipherType) || 0) + 1);
   }
-  const order = ['登录', '安全备注', '卡片', '身份', 'SSH 密钥', '其他'];
+  const order = [1, 2, 3, 4, 5];
+  const seen = new Set<number>(order);
   const typeCounts = order
-    .filter((label) => (counter.get(label) || 0) > 0)
-    .map((label) => ({ label, count: counter.get(label) || 0 }));
+    .filter((type) => (counter.get(type) || 0) > 0)
+    .map((type) => ({ label: typeLabel(type), count: counter.get(type) || 0 }));
+  for (const [type, count] of counter.entries()) {
+    if (!seen.has(type) && count > 0) typeCounts.push({ label: typeLabel(type), count });
+  }
   return {
     totalItems: ciphers.length,
     folderCount: Math.max(0, folderCount),
@@ -1075,7 +1079,7 @@ export default function App() {
       return;
     }
     try {
-      if (!session) throw new Error('Vault key unavailable');
+      if (!session) throw new Error(t('txt_vault_key_unavailable'));
       await createFolder(authedFetch, session, folderName);
       await foldersQuery.refetch();
       pushToast('success', t('txt_folder_created'));
@@ -1088,15 +1092,15 @@ export default function App() {
   async function deleteFolderAction(folderId: string) {
     const id = String(folderId || '').trim();
     if (!id) {
-      pushToast('error', 'Folder not found');
+      pushToast('error', t('txt_folder_not_found'));
       return;
     }
     try {
       await deleteFolder(authedFetch, id);
       await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch()]);
-      pushToast('success', 'Folder deleted');
+      pushToast('success', t('txt_folder_deleted'));
     } catch (error) {
-      pushToast('error', error instanceof Error ? error.message : 'Delete folder failed');
+      pushToast('error', error instanceof Error ? error.message : t('txt_delete_folder_failed'));
       throw error;
     }
   }
@@ -1120,7 +1124,7 @@ export default function App() {
     idMaps: { byIndex: Map<number, string>; bySourceId: Map<string, string> }
   ): Promise<void> {
     if (!attachments.length) return;
-    if (!session?.symEncKey || !session?.symMacKey) throw new Error('Vault key unavailable');
+    if (!session?.symEncKey || !session?.symMacKey) throw new Error(t('txt_vault_key_unavailable'));
 
     const initialCiphers = (await ciphersQuery.refetch()).data || [];
     const cipherById = new Map(initialCiphers.map((cipher) => [String(cipher.id || ''), cipher]));
@@ -1145,7 +1149,7 @@ export default function App() {
     }
 
     if (unresolved.length) {
-      throw new Error(`Failed to map ${unresolved.length} attachment(s) to imported items.`);
+      throw new Error(t('txt_failed_to_map_attachments', { count: unresolved.length }));
     }
 
     await ciphersQuery.refetch();
@@ -1172,7 +1176,7 @@ export default function App() {
     options: { folderMode: 'original' | 'none' | 'target'; targetFolderId: string | null },
     attachments: ImportAttachmentFile[] = []
   ): Promise<ImportResultSummary> {
-    if (!session?.symEncKey || !session?.symMacKey) throw new Error('Vault key unavailable');
+    if (!session?.symEncKey || !session?.symMacKey) throw new Error(t('txt_vault_key_unavailable'));
 
     const mode = options.folderMode || 'original';
     const targetFolderId = (options.targetFolderId || '').trim() || null;
@@ -1284,7 +1288,7 @@ export default function App() {
   }
 
   async function handleExportAction(request: ExportRequest) {
-    if (!session?.symEncKey || !session?.symMacKey) throw new Error('Vault key unavailable');
+    if (!session?.symEncKey || !session?.symMacKey) throw new Error(t('txt_vault_key_unavailable'));
     const masterPassword = String(request.masterPassword || '').trim();
     if (!masterPassword) throw new Error(t('txt_master_password_is_required'));
     const email = String(profile?.email || session.email || '').trim().toLowerCase();
@@ -1294,7 +1298,7 @@ export default function App() {
 
     const rawFolders = foldersQuery.data || [];
     const rawCiphers = ciphersQuery.data || [];
-    if (!rawFolders || !rawCiphers) throw new Error('Vault is not ready yet');
+    if (!rawFolders || !rawCiphers) throw new Error(t('txt_vault_not_ready'));
 
     let plainJsonCache: string | null = null;
     let plainJsonDocCache: Record<string, unknown> | null = null;
@@ -1512,7 +1516,7 @@ export default function App() {
       };
     }
 
-    throw new Error('Unsupported export format');
+    throw new Error(t('txt_unsupported_export_format'));
   }
 
   const hashPathRaw = typeof window !== 'undefined' ? window.location.hash || '' : '';
@@ -1666,8 +1670,12 @@ export default function App() {
           <div className="app-main">
             <aside className="app-side">
               <Link href="/vault" className={`side-link ${location === '/vault' ? 'active' : ''}`}>
-                <Vault size={16} />
+                <KeyRound size={16} />
                 <span>{t('nav_my_vault')}</span>
+              </Link>
+              <Link href="/vault/totp" className={`side-link ${location === '/vault/totp' ? 'active' : ''}`}>
+                <Clock3 size={16} />
+                <span>{t('txt_verification_code')}</span>
               </Link>
               <Link href="/sends" className={`side-link ${location === '/sends' ? 'active' : ''}`}>
                 <SendIcon size={16} />
@@ -1709,6 +1717,9 @@ export default function App() {
                     onBulkDelete={bulkDeleteSendItems}
                     onNotify={pushToast}
                   />
+                </Route>
+                <Route path="/vault/totp">
+                  <TotpCodesPage ciphers={decryptedCiphers} loading={ciphersQuery.isFetching} onNotify={pushToast} />
                 </Route>
                 <Route path="/vault">
                   <VaultPage

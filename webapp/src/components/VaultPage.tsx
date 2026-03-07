@@ -314,7 +314,7 @@ function VaultListIcon({ cipher }: { cipher: Cipher }) {
     return (
       <img
         className="list-icon"
-        src={`/icons/${host}/icon.png`}
+        src={`/icons/${host}/icon.png?v=2`}
         alt=""
         loading="lazy"
         onError={() => setErrored(true)}
@@ -963,7 +963,7 @@ function folderName(id: string | null | undefined): string {
             <>
               <div className="card">
                 <div className="section-head">
-                  <h3 className="detail-title">{isCreating ? `New ${cipherTypeLabel(draft.type)}` : `Edit ${cipherTypeLabel(draft.type)}`}</h3>
+                  <h3 className="detail-title">{isCreating ? t('txt_new_type_header', { type: cipherTypeLabel(draft.type) }) : t('txt_edit_type_header', { type: cipherTypeLabel(draft.type) })}</h3>
                   <button
                     type="button"
                     className={`btn btn-secondary small ${draft.favorite ? 'star-on' : ''}`}
@@ -1738,8 +1738,8 @@ function folderName(id: string | null | undefined): string {
 
       <ConfirmDialog
         open={!!pendingDeleteFolder}
-        title={`${t('txt_delete')} ${t('txt_folder')}`}
-        message={`Delete folder "${pendingDeleteFolder?.decName || pendingDeleteFolder?.name || pendingDeleteFolder?.id || ''}"? Items inside will move to ${t('txt_no_folder')}.`}
+        title={t('txt_delete_folder')}
+        message={t('txt_delete_folder_message', { name: pendingDeleteFolder?.decName || pendingDeleteFolder?.name || pendingDeleteFolder?.id || '' })}
         confirmText={t('txt_delete')}
         cancelText={t('txt_cancel')}
         danger

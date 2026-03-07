@@ -1,5 +1,6 @@
 import { Env, Send, SendAuthType, SendResponse, SendType, DEFAULT_DEV_SECRET } from '../types';
 import { StorageService } from '../services/storage';
+import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
@@ -10,9 +11,17 @@ import {
   verifySendAccessToken,
   verifySendFileDownloadToken,
 } from '../utils/jwt';
+import {
+  deleteBlobObject,
+  getBlobObject,
+  getBlobStorageMaxBytes,
+  getSendFileObjectKey,
+  putBlobObject,
+} from '../services/blob-store';
 
 const SEND_INACCESSIBLE_MSG = 'Send does not exist or is no longer available';
 const SEND_PASSWORD_ITERATIONS = 100_000;
+const SEND_PASSWORD_LIMIT_SCOPE = 'send-password';
 
 function getAliasedProp(source: unknown, aliases: string[]): { present: boolean; value: unknown } {
   if (!source || typeof source !== 'object') return { present: false, value: undefined };
@@ -138,10 +147,6 @@ function normalizeSendDataSizeField(data: Record<string, unknown>): Record<strin
     normalized.size = String(Math.trunc(normalized.size));
   }
   return normalized;
-}
-
-function getSendFilePath(sendId: string, fileId: string): string {
-  return `sends/${sendId}/${fileId}`;
 }
 
 export function isSendAvailable(send: Send): boolean {
@@ -383,12 +388,44 @@ async function getCreatorIdentifier(storage: StorageService, send: Send): Promis
   return owner?.email ?? null;
 }
 
-async function validatePublicSendAccess(send: Send, body: unknown): Promise<Response | null> {
+type PublicSendAccessValidationResult =
+  | { ok: true }
+  | { ok: false; response: Response; reason: 'email_auth_unsupported' | 'password_missing' | 'invalid_password' };
+
+function sendPasswordLimitKey(clientIdentifier: string): string {
+  return `${clientIdentifier}:${SEND_PASSWORD_LIMIT_SCOPE}`;
+}
+
+function sendPasswordLockMessage(retryAfterSeconds: number): string {
+  return `Too many failed send password attempts. Try again in ${Math.ceil(retryAfterSeconds / 60)} minutes.`;
+}
+
+function sendPasswordLockedErrorResponse(retryAfterSeconds: number): Response {
+  return errorResponse(sendPasswordLockMessage(retryAfterSeconds), 429);
+}
+
+function sendPasswordLockedOAuthResponse(retryAfterSeconds: number): Response {
+  const message = sendPasswordLockMessage(retryAfterSeconds);
+  return jsonResponse(
+    {
+      error: 'invalid_grant',
+      error_description: message,
+      send_access_error_type: 'too_many_password_attempts',
+      ErrorModel: {
+        Message: message,
+        Object: 'error',
+      },
+    },
+    429
+  );
+}
+
+async function validatePublicSendAccess(send: Send, body: unknown): Promise<PublicSendAccessValidationResult> {
   if (hasEmailAuth(send)) {
-    return errorResponse(SEND_INACCESSIBLE_MSG, 404);
+    return { ok: false, response: errorResponse(SEND_INACCESSIBLE_MSG, 404), reason: 'email_auth_unsupported' };
   }
 
-  if (!send.passwordHash) return null;
+  if (!send.passwordHash) return { ok: true };
 
   const passwordRaw = getAliasedProp(body, ['password', 'Password']);
   const passwordHashB64Raw = getAliasedProp(body, [
@@ -401,7 +438,7 @@ async function validatePublicSendAccess(send: Send, body: unknown): Promise<Resp
   let validPassword = false;
   if (send.passwordSalt && send.passwordIterations) {
     if (typeof passwordRaw.value !== 'string') {
-      return errorResponse('Password not provided', 401);
+      return { ok: false, response: errorResponse('Password not provided', 401), reason: 'password_missing' };
     }
     validPassword = await verifySendPassword(send, passwordRaw.value);
   } else {
@@ -411,12 +448,14 @@ async function validatePublicSendAccess(send: Send, body: unknown): Promise<Resp
         : typeof passwordRaw.value === 'string'
           ? passwordRaw.value
           : '';
-    if (!candidate) return errorResponse('Password not provided', 401);
+    if (!candidate) return { ok: false, response: errorResponse('Password not provided', 401), reason: 'password_missing' };
     validPassword = verifySendPasswordHashB64(send, candidate);
   }
-  if (!validPassword) return errorResponse('Invalid password', 400);
+  if (!validPassword) {
+    return { ok: false, response: errorResponse('Invalid password', 400), reason: 'invalid_password' };
+  }
 
-  return null;
+  return { ok: true };
 }
 
 // GET /api/sends
@@ -573,6 +612,7 @@ export async function handleCreateSend(request: Request, env: Env, userId: strin
 // POST /api/sends/file/v2
 export async function handleCreateFileSendV2(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
+  const maxFileSize = getBlobStorageMaxBytes(env, LIMITS.send.maxFileSizeBytes);
 
   let body: unknown;
   try {
@@ -590,7 +630,7 @@ export async function handleCreateFileSendV2(request: Request, env: Env, userId:
   const fileLengthRaw = getAliasedProp(body, ['fileLength', 'FileLength']);
   const fileLengthParsed = parseFileLength(fileLengthRaw.value);
   if (!fileLengthParsed.ok) return fileLengthParsed.response;
-  if (fileLengthParsed.value > LIMITS.send.maxFileSizeBytes) {
+  if (fileLengthParsed.value > maxFileSize) {
     return errorResponse('Send storage limit exceeded with this file', 400);
   }
 
@@ -738,6 +778,7 @@ export async function handleUploadSendFile(
   fileId: string
 ): Promise<Response> {
   const storage = new StorageService(env.DB);
+  const maxFileSize = getBlobStorageMaxBytes(env, LIMITS.send.maxFileSizeBytes);
   const send = await storage.getSend(sendId);
   if (!send || send.userId !== userId) {
     return errorResponse('Send not found. Unable to save the file.', 404);
@@ -763,7 +804,7 @@ export async function handleUploadSendFile(
     return errorResponse('No file uploaded', 400);
   }
 
-  if (file.size > LIMITS.send.maxFileSizeBytes) {
+  if (file.size > maxFileSize) {
     return errorResponse('Send storage limit exceeded with this file', 413);
   }
 
@@ -777,15 +818,22 @@ export async function handleUploadSendFile(
     return errorResponse('Send file size does not match.', 400);
   }
 
-  await env.ATTACHMENTS.put(getSendFilePath(sendId, fileId), file.stream(), {
-    httpMetadata: {
+  try {
+    await putBlobObject(env, getSendFileObjectKey(sendId, fileId), file.stream(), {
+      size: file.size,
       contentType: 'application/octet-stream',
-    },
-    customMetadata: {
-      sendId,
-      fileId,
-    },
-  });
+      customMetadata: {
+        sendId,
+        fileId,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('KV object too large')) {
+      return errorResponse('Send storage limit exceeded with this file', 413);
+    }
+    return errorResponse('Attachment storage is not configured', 500);
+  }
 
   await storage.updateRevisionDate(userId);
 
@@ -951,7 +999,7 @@ export async function handleDeleteSend(request: Request, env: Env, userId: strin
     const data = parseStoredSendData(send);
     const fileId = typeof data.id === 'string' ? data.id : null;
     if (fileId) {
-      await env.ATTACHMENTS.delete(getSendFilePath(send.id, fileId));
+      await deleteBlobObject(env, getSendFileObjectKey(send.id, fileId));
     }
   }
 
@@ -1016,9 +1064,34 @@ export async function handleAccessSend(request: Request, env: Env, accessId: str
     body = {};
   }
 
-  const validationErr = await validatePublicSendAccess(send, body);
-  if (validationErr) {
-    return validationErr;
+  let sendPasswordLimitIpKey: string | null = null;
+  let sendPasswordRateLimit: RateLimitService | null = null;
+  if (send.passwordHash) {
+    const clientIdentifier = getClientIdentifier(request);
+    if (!clientIdentifier) {
+      return errorResponse('Client IP is required', 403);
+    }
+    sendPasswordLimitIpKey = sendPasswordLimitKey(clientIdentifier);
+    sendPasswordRateLimit = new RateLimitService(env.DB);
+    const sendPasswordCheck = await sendPasswordRateLimit.checkLoginAttempt(sendPasswordLimitIpKey);
+    if (!sendPasswordCheck.allowed) {
+      return sendPasswordLockedErrorResponse(sendPasswordCheck.retryAfterSeconds || 60);
+    }
+  }
+
+  const validation = await validatePublicSendAccess(send, body);
+  if (!validation.ok) {
+    if (validation.reason === 'invalid_password' && sendPasswordRateLimit && sendPasswordLimitIpKey) {
+      const failed = await sendPasswordRateLimit.recordFailedLogin(sendPasswordLimitIpKey);
+      if (failed.locked) {
+        return sendPasswordLockedErrorResponse(failed.retryAfterSeconds || 60);
+      }
+    }
+    return validation.response;
+  }
+
+  if (send.passwordHash && sendPasswordRateLimit && sendPasswordLimitIpKey) {
+    await sendPasswordRateLimit.clearLoginAttempts(sendPasswordLimitIpKey);
   }
 
   if (send.type === SendType.Text) {
@@ -1065,9 +1138,34 @@ export async function handleAccessSendFile(
     body = {};
   }
 
-  const validationErr = await validatePublicSendAccess(send, body);
-  if (validationErr) {
-    return validationErr;
+  let sendPasswordLimitIpKey: string | null = null;
+  let sendPasswordRateLimit: RateLimitService | null = null;
+  if (send.passwordHash) {
+    const clientIdentifier = getClientIdentifier(request);
+    if (!clientIdentifier) {
+      return errorResponse('Client IP is required', 403);
+    }
+    sendPasswordLimitIpKey = sendPasswordLimitKey(clientIdentifier);
+    sendPasswordRateLimit = new RateLimitService(env.DB);
+    const sendPasswordCheck = await sendPasswordRateLimit.checkLoginAttempt(sendPasswordLimitIpKey);
+    if (!sendPasswordCheck.allowed) {
+      return sendPasswordLockedErrorResponse(sendPasswordCheck.retryAfterSeconds || 60);
+    }
+  }
+
+  const validation = await validatePublicSendAccess(send, body);
+  if (!validation.ok) {
+    if (validation.reason === 'invalid_password' && sendPasswordRateLimit && sendPasswordLimitIpKey) {
+      const failed = await sendPasswordRateLimit.recordFailedLogin(sendPasswordLimitIpKey);
+      if (failed.locked) {
+        return sendPasswordLockedErrorResponse(failed.retryAfterSeconds || 60);
+      }
+    }
+    return validation.response;
+  }
+
+  if (send.passwordHash && sendPasswordRateLimit && sendPasswordLimitIpKey) {
+    await sendPasswordRateLimit.clearLoginAttempts(sendPasswordLimitIpKey);
   }
 
   const updated = await storage.incrementSendAccessCount(send.id);
@@ -1195,14 +1293,22 @@ export async function handleDownloadSendFile(
     return errorResponse('Token mismatch', 401);
   }
 
-  const object = await env.ATTACHMENTS.get(getSendFilePath(sendId, fileId));
+  const storage = new StorageService(env.DB);
+  const object = await getBlobObject(env, getSendFileObjectKey(sendId, fileId));
   if (!object) {
     return errorResponse('Send file not found', 404);
   }
 
+  // Reuse the existing one-time token store used by attachment downloads.
+  // Prefix avoids accidental cross-domain JTI collisions.
+  const firstUse = await storage.consumeAttachmentDownloadToken(`send:${claims.jti}`, claims.exp);
+  if (!firstUse) {
+    return errorResponse('Invalid or expired token', 401);
+  }
+
   return new Response(object.body, {
     headers: {
-      'Content-Type': 'application/octet-stream',
+      'Content-Type': object.contentType || 'application/octet-stream',
       'Content-Length': String(object.size),
       'Cache-Control': 'private, no-cache',
     },
@@ -1213,7 +1319,9 @@ export async function issueSendAccessToken(
   env: Env,
   sendIdOrAccessId: string,
   passwordHashB64?: string | null,
-  password?: string | null
+  password?: string | null,
+  rateLimit?: RateLimitService,
+  sendPasswordLimitIpKey?: string
 ): Promise<{ token: string } | { error: Response }> {
   const jwt = getSafeJwtSecret(env);
   if (!jwt.ok) {
@@ -1259,6 +1367,15 @@ export async function issueSendAccessToken(
   }
 
   if (send.passwordHash) {
+    if (rateLimit && sendPasswordLimitIpKey) {
+      const sendPasswordCheck = await rateLimit.checkLoginAttempt(sendPasswordLimitIpKey);
+      if (!sendPasswordCheck.allowed) {
+        return {
+          error: sendPasswordLockedOAuthResponse(sendPasswordCheck.retryAfterSeconds || 60),
+        };
+      }
+    }
+
     let ok = false;
     if (passwordHashB64) {
       ok = verifySendPasswordHashB64(send, passwordHashB64);
@@ -1267,6 +1384,14 @@ export async function issueSendAccessToken(
     }
 
     if (!ok) {
+      if (rateLimit && sendPasswordLimitIpKey) {
+        const failed = await rateLimit.recordFailedLogin(sendPasswordLimitIpKey);
+        if (failed.locked) {
+          return {
+            error: sendPasswordLockedOAuthResponse(failed.retryAfterSeconds || 60),
+          };
+        }
+      }
       return {
         error: jsonResponse(
           {
@@ -1282,9 +1407,12 @@ export async function issueSendAccessToken(
         ),
       };
     }
+
+    if (rateLimit && sendPasswordLimitIpKey) {
+      await rateLimit.clearLoginAttempts(sendPasswordLimitIpKey);
+    }
   }
 
   const token = await createSendAccessToken(send.id, jwt.secret);
   return { token };
 }
-

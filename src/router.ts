@@ -142,6 +142,17 @@ function handleNwFavicon(): Response {
   });
 }
 
+const BITWARDEN_DEFAULT_ICON_SHA256 = 'aaa64871332ad5b7d28fe8874efb19c2d9cc2f1e6de75d52b080b438225a0783';
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return bytesToHex(new Uint8Array(digest));
+}
+
 function isValidIconHostname(hostname: string): boolean {
   if (!hostname) return false;
   if (hostname.length > 253) return false;
@@ -192,6 +203,9 @@ async function handleGetIcon(request: Request, env: Env, hostname: string): Prom
 
     if (resp.ok) {
       const body = await resp.arrayBuffer();
+      if (body.byteLength === 500 && (await sha256Hex(body)) === BITWARDEN_DEFAULT_ICON_SHA256) {
+        return new Response(null, { status: 204 });
+      }
       const iconResponse = new Response(body, {
         status: 200,
         headers: {
@@ -215,9 +229,23 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const method = request.method;
   const clientId = getClientIdentifier(request);
 
-  async function enforcePublicRateLimit(): Promise<Response | null> {
+  async function enforcePublicRateLimit(
+    category: string = 'public',
+    maxRequests: number = LIMITS.rateLimit.publicRequestsPerMinute
+  ): Promise<Response | null> {
+    if (!clientId) {
+      return new Response(JSON.stringify({
+        error: 'Forbidden',
+        error_description: 'Client IP is required',
+      }), {
+        status: 403,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+    }
     const rateLimit = new RateLimitService(env.DB);
-    const check = await rateLimit.consumeBudget(`${clientId}:public`, LIMITS.rateLimit.publicRequestsPerMinute);
+    const check = await rateLimit.consumeBudget(`${clientId}:${category}`, maxRequests);
     if (check.allowed) return null;
     return new Response(JSON.stringify({
       error: 'Too many requests',
@@ -254,11 +282,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     // Setup status
     if (path === '/setup/status' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       return handleSetupStatus(request, env);
     }
 
     // Web runtime config for static client bootstrap
     if (path === '/api/web/config' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       const jwtUnsafeReason = jwtSecretUnsafeReason(env);
       return jsonResponse({
         defaultKdfIterations: LIMITS.auth.defaultKdfIterations,
@@ -338,30 +370,27 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return handleDownloadSendFile(request, env, sendId, fileId);
     }
 
-    // Notifications hub (stub - no auth required, return 200 for connection)
-    if (path.startsWith('/notifications/')) {
-      const blocked = await enforcePublicRateLimit();
-      if (blocked) return blocked;
-      return new Response(null, { status: 200 });
+    // Identity endpoints (no auth required)
+    if (path === '/identity/connect/token' && method === 'POST') {
+      return handleToken(request, env);
     }
 
-    // Known device check (no auth required)
+    // Known device check (no auth required).
     if (path === '/api/devices/knowndevice' && method === 'GET') {
       const blocked = await enforcePublicRateLimit();
       if (blocked) return jsonResponse(false);
       return handleKnownDevice(request, env);
     }
 
-    // Identity endpoints (no auth required)
-    if (path === '/identity/connect/token' && method === 'POST') {
-      return handleToken(request, env);
-    }
-
     if ((path === '/identity/connect/revocation' || path === '/identity/connect/revoke') && method === 'POST') {
+      const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+      if (blocked) return blocked;
       return handleRevocation(request, env);
     }
 
     if (path === '/identity/accounts/prelogin' && method === 'POST') {
+      const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+      if (blocked) return blocked;
       return handlePrelogin(request, env);
     }
 
@@ -374,6 +403,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // They also tolerate different casing, but their response models use PascalCase.
     const isConfigRequest = (path === '/config' || path === '/api/config') && method === 'GET';
     if (isConfigRequest) {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       const origin = url.origin;
       return jsonResponse({
         // ── Version Strategy (Plan E) ──────────────────────────────────────
@@ -414,6 +445,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     // Version endpoint (some clients probe this to validate the server)
     if (path === '/api/version' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       return jsonResponse(LIMITS.compatibility.bitwardenServerVersion);  // Always same value as /config.version
     }
 
@@ -421,6 +454,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // - first user can self-register and becomes admin
     // - later registrations require inviteCode in request body
     if (path === '/api/accounts/register' && method === 'POST') {
+      const blocked = await enforcePublicRateLimit('register', LIMITS.rateLimit.registerRequestsPerMinute);
+      if (blocked) return blocked;
       if (!isSameOriginWriteRequest(request)) {
         return errorResponse('Forbidden origin', 403);
       }
@@ -523,6 +558,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Sync endpoint
     if (path === '/api/sync' && method === 'GET') {
       return handleSync(request, env, userId);
+    }
+
+    // Notifications hub (stub): now requires authentication.
+    if (path.startsWith('/notifications/')) {
+      return new Response(null, { status: 200 });
     }
 
     // Cipher endpoints

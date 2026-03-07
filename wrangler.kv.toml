@@ -14,6 +14,5 @@ command = "npm run build"
 binding = "DB"
 database_name = "nodewarden-db"
 
-[[r2_buckets]]
-binding = "ATTACHMENTS"
-bucket_name = "nodewarden-attachments"
+[[kv_namespaces]]
+binding = "ATTACHMENTS_KV"

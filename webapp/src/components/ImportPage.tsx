@@ -118,7 +118,7 @@ async function derivePasswordProtectedFileKey(
     const memoryMiB = Number(parsed.kdfMemory || 0);
     const parallelism = Number(parsed.kdfParallelism || 0);
     if (!Number.isFinite(memoryMiB) || memoryMiB <= 0 || !Number.isFinite(parallelism) || parallelism <= 0) {
-      throw new Error('Invalid Argon2id parameters in export file.');
+      throw new Error(t('txt_invalid_argon2id_params'));
     }
     const memoryKiB = Math.floor(memoryMiB * 1024);
     const maxmem = memoryKiB * 1024 + 1024 * 1024;
@@ -131,7 +131,7 @@ async function derivePasswordProtectedFileKey(
       asyncTick: 10,
     });
   } else {
-    throw new Error(`Unsupported kdfType: ${kdfType}`);
+    throw new Error(t('txt_unsupported_kdf_type', { type: String(kdfType) }));
   }
 
   const enc = await hkdfExpand(keyMaterial, 'enc', 32);
@@ -152,7 +152,7 @@ async function decryptPasswordProtectedExport(parsed: BitwardenPasswordProtected
   try {
     await decryptStr(parsed.encKeyValidation_DO_NOT_EDIT, key.enc, key.mac);
   } catch {
-    throw new Error('Invalid file password.');
+    throw new Error(t('txt_invalid_file_password'));
   }
 
   const plainJson = await decryptStr(parsed.data, key.enc, key.mac);
@@ -317,16 +317,16 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
     if (isRecord(parsed) && parsed.encrypted === true) {
       const accountEncrypted = parsed as BitwardenJsonInput;
       if (!accountKeys?.encB64 || !accountKeys?.macB64) {
-        throw new Error('Vault key unavailable. Please unlock vault and try again.');
+        throw new Error(t('txt_vault_key_unavailable'));
       }
       const validation = String(accountEncrypted.encKeyValidation_DO_NOT_EDIT || '').trim();
-      if (!validation) throw new Error('Invalid encrypted export file.');
+      if (!validation) throw new Error(t('txt_invalid_encrypted_export'));
       const accountEncKey = base64ToBytes(accountKeys.encB64);
       const accountMacKey = base64ToBytes(accountKeys.macB64);
       try {
         await decryptStr(validation, accountEncKey, accountMacKey);
       } catch {
-        throw new Error('This encrypted export belongs to another account.');
+        throw new Error(t('txt_export_belongs_to_another_account'));
       }
       return onImportEncryptedRaw(
         normalizeBitwardenEncryptedAccountImport(accountEncrypted),
@@ -355,7 +355,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
     const encryptedPayload = String(parsed.nodewardenAttachmentsEnc || '').trim();
     if (!encryptedPayload) return [];
     if (!accountKeys?.encB64 || !accountKeys?.macB64) {
-      throw new Error('Vault key unavailable. Please unlock vault and try again.');
+      throw new Error(t('txt_vault_key_unavailable'));
     }
     const accountEnc = base64ToBytes(accountKeys.encB64);
     const accountMac = base64ToBytes(accountKeys.macB64);
