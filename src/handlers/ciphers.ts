@@ -1,9 +1,20 @@
 import { Env, Cipher, CipherResponse, Attachment } from '../types';
 import { StorageService } from '../services/storage';
+import { notifyUserVaultSync } from '../durable/notifications-hub';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { deleteAllAttachmentsForCipher } from './attachments';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
+import { readActingDeviceIdentifier } from '../utils/device';
+
+async function notifyVaultSyncForRequest(
+  request: Request,
+  env: Env,
+  userId: string,
+  revisionDate: string
+): Promise<void> {
+  await notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+}
 
 function getAliasedProp(source: any, aliases: string[]): { present: boolean; value: any } {
   if (!source || typeof source !== 'object') return { present: false, value: undefined };
@@ -15,29 +26,80 @@ function getAliasedProp(source: any, aliases: string[]): { present: boolean; val
   return { present: false, value: undefined };
 }
 
-// Android 2026.2.0 expects fido2Credentials[].counter to be a string.
-export function normalizeCipherLoginForCompatibility(login: any): any {
-  if (!login || typeof login !== 'object') return login ?? null;
+function looksLikeCipherString(value: unknown): boolean {
+  return /^\d+\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+(?:\|[A-Za-z0-9+/=]+)?$/.test(String(value || '').trim());
+}
 
-  const fido2 = Array.isArray(login.fido2Credentials)
-    ? login.fido2Credentials.map((cred: any) => {
-        if (!cred || typeof cred !== 'object') return cred;
-        const rawCounter = cred.counter;
-        const counter =
-          rawCounter === null || rawCounter === undefined
-            ? '0'
-            : String(rawCounter);
-        return {
-          ...cred,
-          counter,
-        };
-      })
-    : login.fido2Credentials;
+export function shouldOmitPasskeysForResponse(request: Request | null | undefined): boolean {
+  const userAgent = String(request?.headers.get('user-agent') || '').toLowerCase();
+  if (!userAgent) return false;
+
+  // Temporary compatibility fallback:
+  // mobile clients expect official EncString payloads for most FIDO2 fields.
+  // Keep passkeys available everywhere, but suppress only legacy malformed data
+  // for mobile clients so newly-saved credentials can flow through unchanged.
+  return (
+    userAgent.includes('android') ||
+    userAgent.includes('iphone') ||
+    userAgent.includes('ipad') ||
+    userAgent.includes('ios')
+  );
+}
+
+export function normalizeCipherLoginForStorage(login: any): any {
+  if (!login || typeof login !== 'object') return login ?? null;
 
   return {
     ...login,
-    fido2Credentials: fido2,
+    fido2Credentials: Array.isArray(login.fido2Credentials) ? login.fido2Credentials : null,
   };
+}
+
+export function normalizeCipherLoginForCompatibility(
+  login: any,
+  options?: { omitFido2Credentials?: boolean }
+): any {
+  const normalized = normalizeCipherLoginForStorage(login);
+  if (!normalized || typeof normalized !== 'object') return normalized ?? null;
+  if (!options?.omitFido2Credentials) return normalized;
+
+  const credentials = Array.isArray(normalized.fido2Credentials) ? normalized.fido2Credentials : null;
+  if (!credentials?.length) return normalized;
+
+  const hasMalformedCredential = credentials.some((credential: any) => {
+    if (!credential || typeof credential !== 'object') return true;
+    const requiredEncryptedFields = [
+      credential.credentialId,
+      credential.keyType,
+      credential.keyAlgorithm,
+      credential.keyCurve,
+      credential.keyValue,
+      credential.rpId,
+      credential.counter,
+      credential.discoverable,
+    ];
+    const optionalEncryptedFields = [
+      credential.userHandle,
+      credential.userName,
+      credential.rpName,
+      credential.userDisplayName,
+    ];
+
+    if (requiredEncryptedFields.some((value) => !looksLikeCipherString(value))) {
+      return true;
+    }
+    if (optionalEncryptedFields.some((value) => value != null && !looksLikeCipherString(value))) {
+      return true;
+    }
+    return false;
+  });
+
+  return hasMalformedCredential
+    ? {
+        ...normalized,
+        fido2Credentials: null,
+      }
+    : normalized;
 }
 
 // Android 2026.2.0 requires sshKey.keyFingerprint in sync payloads.
@@ -81,10 +143,14 @@ export function formatAttachments(attachments: Attachment[]): any[] | null {
 // Uses opaque passthrough: spreads ALL stored fields (including unknown/future ones),
 // then overlays server-computed fields. This ensures new Bitwarden client fields
 // survive a round-trip without code changes.
-export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = []): CipherResponse {
+export function cipherToResponse(
+  cipher: Cipher,
+  attachments: Attachment[] = [],
+  options?: { omitFido2Credentials?: boolean }
+): CipherResponse {
   // Strip internal-only fields that must not appear in the API response
   const { userId, createdAt, updatedAt, deletedAt, ...passthrough } = cipher;
-  const normalizedLogin = normalizeCipherLoginForCompatibility((passthrough as any).login ?? null);
+  const normalizedLogin = normalizeCipherLoginForCompatibility((passthrough as any).login ?? null, options);
   const normalizedSshKey = normalizeCipherSshKeyForCompatibility((passthrough as any).sshKey ?? null);
 
   return {
@@ -119,6 +185,7 @@ export async function handleGetCiphers(request: Request, env: Env, userId: strin
   const url = new URL(request.url);
   const includeDeleted = url.searchParams.get('deleted') === 'true';
   const pagination = parsePagination(url);
+  const omitFido2Credentials = shouldOmitPasskeysForResponse(request);
 
   let filteredCiphers: Cipher[];
   let continuationToken: string | null = null;
@@ -145,7 +212,7 @@ export async function handleGetCiphers(request: Request, env: Env, userId: strin
   const cipherResponses = [];
   for (const cipher of filteredCiphers) {
     const attachments = attachmentsByCipher.get(cipher.id) || [];
-    cipherResponses.push(cipherToResponse(cipher, attachments));
+    cipherResponses.push(cipherToResponse(cipher, attachments, { omitFido2Credentials }));
   }
 
   return jsonResponse({
@@ -165,7 +232,11 @@ export async function handleGetCipher(request: Request, env: Env, userId: string
   }
 
   const attachments = await storage.getAttachmentsByCipher(cipher.id);
-  return jsonResponse(cipherToResponse(cipher, attachments));
+  return jsonResponse(
+    cipherToResponse(cipher, attachments, {
+      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
+    })
+  );
 }
 
 async function verifyFolderOwnership(storage: StorageService, folderId: string | null | undefined, userId: string): Promise<boolean> {
@@ -204,7 +275,7 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
     updatedAt: now,
     deletedAt: null,
   };
-  cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  cipher.login = normalizeCipherLoginForStorage(cipher.login);
   cipher.sshKey = normalizeCipherSshKeyForCompatibility(cipher.sshKey);
   const createFields = getAliasedProp(cipherData, ['fields', 'Fields']);
   cipher.fields = createFields.present ? (createFields.value ?? null) : (cipher.fields ?? null);
@@ -216,9 +287,15 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
   }
 
   await storage.saveCipher(cipher);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
-  return jsonResponse(cipherToResponse(cipher), 200);
+  return jsonResponse(
+    cipherToResponse(cipher, [], {
+      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
+    }),
+    200
+  );
 }
 
 // PUT /api/ciphers/:id
@@ -256,7 +333,7 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     updatedAt: new Date().toISOString(),
     deletedAt: existingCipher.deletedAt,
   };
-  cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  cipher.login = normalizeCipherLoginForStorage(cipher.login);
   cipher.sshKey = normalizeCipherSshKeyForCompatibility(cipher.sshKey);
 
   // Custom fields deletion compatibility:
@@ -277,9 +354,14 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
   }
 
   await storage.saveCipher(cipher);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
-  return jsonResponse(cipherToResponse(cipher));
+  return jsonResponse(
+    cipherToResponse(cipher, [], {
+      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
+    })
+  );
 }
 
 // DELETE /api/ciphers/:id
@@ -295,9 +377,14 @@ export async function handleDeleteCipher(request: Request, env: Env, userId: str
   cipher.deletedAt = new Date().toISOString();
   cipher.updatedAt = cipher.deletedAt;
   await storage.saveCipher(cipher);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
-  return jsonResponse(cipherToResponse(cipher));
+  return jsonResponse(
+    cipherToResponse(cipher, [], {
+      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
+    })
+  );
 }
 
 // DELETE /api/ciphers/:id (compat mode)
@@ -316,7 +403,8 @@ export async function handleDeleteCipherCompat(request: Request, env: Env, userI
   if (cipher.deletedAt) {
     await deleteAllAttachmentsForCipher(env, id);
     await storage.deleteCipher(id, userId);
-    await storage.updateRevisionDate(userId);
+    const revisionDate = await storage.updateRevisionDate(userId);
+    await notifyVaultSyncForRequest(request, env, userId, revisionDate);
     return new Response(null, { status: 204 });
   }
 
@@ -336,7 +424,8 @@ export async function handlePermanentDeleteCipher(request: Request, env: Env, us
   await deleteAllAttachmentsForCipher(env, id);
 
   await storage.deleteCipher(id, userId);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
   return new Response(null, { status: 204 });
 }
@@ -353,9 +442,14 @@ export async function handleRestoreCipher(request: Request, env: Env, userId: st
   cipher.deletedAt = null;
   cipher.updatedAt = new Date().toISOString();
   await storage.saveCipher(cipher);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
-  return jsonResponse(cipherToResponse(cipher));
+  return jsonResponse(
+    cipherToResponse(cipher, [], {
+      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
+    })
+  );
 }
 
 // PUT /api/ciphers/:id/partial - Update only favorite/folderId
@@ -387,9 +481,14 @@ export async function handlePartialUpdateCipher(request: Request, env: Env, user
   cipher.updatedAt = new Date().toISOString();
 
   await storage.saveCipher(cipher);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
-  return jsonResponse(cipherToResponse(cipher));
+  return jsonResponse(
+    cipherToResponse(cipher, [], {
+      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
+    })
+  );
 }
 
 // POST/PUT /api/ciphers/move - Bulk move to folder
@@ -412,7 +511,88 @@ export async function handleBulkMoveCiphers(request: Request, env: Env, userId: 
     if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
-  await storage.bulkMoveCiphers(body.ids, body.folderId || null, userId);
+  const revisionDate = await storage.bulkMoveCiphers(body.ids, body.folderId || null, userId);
+  if (revisionDate) {
+    await notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  }
+
+  return new Response(null, { status: 204 });
+}
+
+// POST /api/ciphers/delete - Bulk soft delete
+export async function handleBulkDeleteCiphers(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+
+  let body: { ids?: string[] };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  if (!body.ids || !Array.isArray(body.ids)) {
+    return errorResponse('ids array is required', 400);
+  }
+
+  const revisionDate = await storage.bulkSoftDeleteCiphers(body.ids, userId);
+  if (revisionDate) {
+    await notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  }
+
+  return new Response(null, { status: 204 });
+}
+
+// POST /api/ciphers/restore - Bulk restore
+export async function handleBulkRestoreCiphers(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+
+  let body: { ids?: string[] };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  if (!body.ids || !Array.isArray(body.ids)) {
+    return errorResponse('ids array is required', 400);
+  }
+
+  const revisionDate = await storage.bulkRestoreCiphers(body.ids, userId);
+  if (revisionDate) {
+    await notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  }
+
+  return new Response(null, { status: 204 });
+}
+
+// POST /api/ciphers/delete-permanent - Bulk permanent delete
+export async function handleBulkPermanentDeleteCiphers(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+
+  let body: { ids?: string[] };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  if (!body.ids || !Array.isArray(body.ids)) {
+    return errorResponse('ids array is required', 400);
+  }
+
+  const ids = Array.from(new Set(body.ids.map((id) => String(id || '').trim()).filter(Boolean)));
+  if (!ids.length) {
+    return new Response(null, { status: 204 });
+  }
+
+  for (const id of ids) {
+    await deleteAllAttachmentsForCipher(env, id);
+  }
+
+  const revisionDate = await storage.bulkDeleteCiphers(ids, userId);
+  if (revisionDate) {
+    await notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  }
 
   return new Response(null, { status: 204 });
 }

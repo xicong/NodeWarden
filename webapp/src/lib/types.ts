@@ -278,7 +278,7 @@ export interface TokenError {
 
 export interface ToastMessage {
   id: string;
-  type: 'success' | 'error';
+  type: 'success' | 'error' | 'warning';
   text: string;
 }
 
@@ -304,6 +304,7 @@ export interface AuthorizedDevice {
   type: number;
   creationDate: string | null;
   revisionDate: string | null;
+  online: boolean;
   trusted: boolean;
   trustedTokenCount: number;
   trustedUntil: string | null;

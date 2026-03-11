@@ -3,7 +3,10 @@ import ConfirmDialog from '@/components/ConfirmDialog';
 import { calcTotpNow } from '@/lib/crypto';
 import { computeSshFingerprint, generateDefaultSshKeyMaterial } from '@/lib/ssh';
 import {
+  ArrowUpDown,
+  Check,
   CheckCheck,
+  ChevronLeft,
   Clipboard,
   CreditCard,
   Download,
@@ -43,15 +46,19 @@ interface VaultPageProps {
   onUpdate: (cipher: Cipher, draft: VaultDraft, options?: { addFiles?: File[]; removeAttachmentIds?: string[] }) => Promise<void>;
   onDelete: (cipher: Cipher) => Promise<void>;
   onBulkDelete: (ids: string[]) => Promise<void>;
+  onBulkPermanentDelete: (ids: string[]) => Promise<void>;
+  onBulkRestore: (ids: string[]) => Promise<void>;
   onBulkMove: (ids: string[], folderId: string | null) => Promise<void>;
   onVerifyMasterPassword: (email: string, password: string) => Promise<void>;
-  onNotify: (type: 'success' | 'error', text: string) => void;
+  onNotify: (type: 'success' | 'error' | 'warning', text: string) => void;
   onCreateFolder: (name: string) => Promise<void>;
   onDeleteFolder: (folderId: string) => Promise<void>;
+  onBulkDeleteFolders: (folderIds: string[]) => Promise<void>;
   onDownloadAttachment: (cipher: Cipher, attachmentId: string) => Promise<void>;
 }
 
 type TypeFilter = 'login' | 'card' | 'identity' | 'note' | 'ssh';
+type VaultSortMode = 'edited' | 'created' | 'name';
 type SidebarFilter =
   | { kind: 'all' }
   | { kind: 'favorite' }
@@ -70,6 +77,16 @@ const CREATE_TYPE_OPTIONS: TypeOption[] = [
   { type: 4, label: t('txt_identity') },
   { type: 2, label: t('txt_note') },
   { type: 5, label: t('txt_ssh_key') },
+];
+
+const VAULT_SORT_STORAGE_KEY = 'nodewarden.vault.sort.v1';
+const MOBILE_LAYOUT_QUERY = '(max-width: 900px)';
+const VAULT_LIST_ROW_HEIGHT = 66;
+const VAULT_LIST_OVERSCAN = 10;
+const VAULT_SORT_OPTIONS: Array<{ value: VaultSortMode; label: string }> = [
+  { value: 'edited', label: t('txt_sort_last_edited') },
+  { value: 'created', label: t('txt_sort_created') },
+  { value: 'name', label: t('txt_sort_name') },
 ];
 
 function CreateTypeIcon({ type }: { type: number }) {
@@ -119,12 +136,6 @@ function parseFieldType(value: number | string | null | undefined): CustomFieldT
   if (value === '2' || String(value).toLowerCase() === 'boolean') return 2;
   if (value === '3' || String(value).toLowerCase() === 'linked') return 3;
   return 0;
-}
-
-function fieldTypeLabel(type: CustomFieldType): string {
-  if (type === 3) return t('txt_linked');
-  const found = FIELD_TYPE_OPTIONS.find((x) => x.value === type);
-  return found ? found.label : t('txt_text');
 }
 
 function toBooleanFieldValue(raw: string): boolean {
@@ -292,6 +303,20 @@ function formatAttachmentSize(attachment: CipherAttachment): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function sortTimeValue(cipher: Cipher): number {
+  const candidates = [cipher.revisionDate, cipher.creationDate];
+  for (const value of candidates) {
+    const time = new Date(String(value || '')).getTime();
+    if (Number.isFinite(time)) return time;
+  }
+  return 0;
+}
+
+function creationTimeValue(cipher: Cipher): number {
+  const time = new Date(String(cipher.creationDate || '')).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
 function firstPasskeyCreationTime(cipher: Cipher | null): string | null {
   const credentials = cipher?.login?.fido2Credentials;
   if (!Array.isArray(credentials) || credentials.length === 0) return null;
@@ -305,19 +330,23 @@ function firstPasskeyCreationTime(cipher: Cipher | null): string | null {
 const TOTP_PERIOD_SECONDS = 30;
 const TOTP_RING_RADIUS = 14;
 const TOTP_RING_CIRCUMFERENCE = 2 * Math.PI * TOTP_RING_RADIUS;
+const failedIconHosts = new Set<string>();
 
 function VaultListIcon({ cipher }: { cipher: Cipher }) {
   const uri = firstCipherUri(cipher);
   const host = hostFromUri(uri);
-  const [errored, setErrored] = useState(false);
+  const [errored, setErrored] = useState(() => (host ? failedIconHosts.has(host) : false));
   if (host && !errored) {
     return (
       <img
         className="list-icon"
-        src={`/icons/${host}/icon.png`}
+        src={`/icons/${host}/icon.png?v=2`}
         alt=""
         loading="lazy"
-        onError={() => setErrored(true)}
+        onError={() => {
+          failedIconHosts.add(host);
+          setErrored(true);
+        }}
       />
     );
   }
@@ -344,6 +373,8 @@ export default function VaultPage(props: VaultPageProps) {
   const [searchInput, setSearchInput] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [searchComposing, setSearchComposing] = useState(false);
+  const [sortMode, setSortMode] = useState<VaultSortMode>('edited');
+  const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>({ kind: 'all' });
   const [selectedCipherId, setSelectedCipherId] = useState('');
   const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>({});
@@ -364,6 +395,7 @@ export default function VaultPage(props: VaultPageProps) {
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
   const [pendingDeleteFolder, setPendingDeleteFolder] = useState<Folder | null>(null);
+  const [deleteAllFoldersOpen, setDeleteAllFoldersOpen] = useState(false);
   const [totpLive, setTotpLive] = useState<{ code: string; remain: number } | null>(null);
   const [hiddenFieldVisibleMap, setHiddenFieldVisibleMap] = useState<Record<number, boolean>>({});
   const [attachmentQueue, setAttachmentQueue] = useState<File[]>([]);
@@ -372,10 +404,38 @@ export default function VaultPage(props: VaultPageProps) {
   const [repromptOpen, setRepromptOpen] = useState(false);
   const [repromptPassword, setRepromptPassword] = useState('');
   const [repromptApprovedCipherId, setRepromptApprovedCipherId] = useState<string | null>(null);
+  const [isMobileLayout, setIsMobileLayout] = useState(false);
+  const [mobilePanel, setMobilePanel] = useState<'list' | 'detail' | 'edit'>('list');
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const createMenuRef = useRef<HTMLDivElement | null>(null);
+  const sortMenuRef = useRef<HTMLDivElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const listPanelRef = useRef<HTMLDivElement | null>(null);
   const sshSeedTicketRef = useRef(0);
   const sshFingerprintTicketRef = useRef(0);
+  const [listScrollTop, setListScrollTop] = useState(0);
+  const [listViewportHeight, setListViewportHeight] = useState(0);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia(MOBILE_LAYOUT_QUERY);
+    const sync = () => setIsMobileLayout(media.matches);
+    sync();
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', sync);
+      return () => media.removeEventListener('change', sync);
+    }
+    media.addListener(sync);
+    return () => media.removeListener(sync);
+  }, []);
+
+  useEffect(() => {
+    const onToggleSidebar = () => {
+      setMobileSidebarOpen((open) => !open);
+    };
+    window.addEventListener('nodewarden:toggle-sidebar', onToggleSidebar);
+    return () => window.removeEventListener('nodewarden:toggle-sidebar', onToggleSidebar);
+  }, []);
 
   useEffect(() => {
     const onQuickAdd = () => {
@@ -383,6 +443,35 @@ export default function VaultPage(props: VaultPageProps) {
     };
     window.addEventListener('nodewarden:add-item', onQuickAdd);
     return () => window.removeEventListener('nodewarden:add-item', onQuickAdd);
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = String(localStorage.getItem(VAULT_SORT_STORAGE_KEY) || '').trim() as VaultSortMode;
+      if (saved === 'edited' || saved === 'created' || saved === 'name') {
+        setSortMode(saved);
+      }
+    } catch {
+      // ignore storage read failures
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(VAULT_SORT_STORAGE_KEY, sortMode);
+    } catch {
+      // ignore storage write failures
+    }
+  }, [sortMode]);
+
+  useEffect(() => {
+    const node = listPanelRef.current;
+    if (!node) return;
+    const updateSize = () => setListViewportHeight(node.clientHeight || 0);
+    updateSize();
+    const resizeObserver = new ResizeObserver(updateSize);
+    resizeObserver.observe(node);
+    return () => resizeObserver.disconnect();
   }, []);
 
   useEffect(() => {
@@ -405,10 +494,42 @@ export default function VaultPage(props: VaultPageProps) {
   }, [createMenuOpen]);
 
   useEffect(() => {
+    const onPointerDown = (event: Event) => {
+      if (!sortMenuOpen) return;
+      const target = event.target as Node | null;
+      if (sortMenuRef.current && target && !sortMenuRef.current.contains(target)) {
+        setSortMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSortMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [sortMenuOpen]);
+
+  useEffect(() => {
     setRepromptApprovedCipherId(null);
     setRepromptPassword('');
     setRepromptOpen(false);
   }, [selectedCipherId]);
+
+  useEffect(() => {
+    if (!isMobileLayout) {
+      setMobilePanel('list');
+      setMobileSidebarOpen(false);
+      return;
+    }
+    if (isEditing) {
+      setMobilePanel('edit');
+    } else if (!selectedCipherId) {
+      setMobilePanel('list');
+    }
+  }, [isMobileLayout, isEditing, selectedCipherId]);
 
   useEffect(() => {
     if (searchComposing) return;
@@ -422,7 +543,7 @@ export default function VaultPage(props: VaultPageProps) {
   }, [isEditing, draft?.id, draft?.type]);
 
   const filteredCiphers = useMemo(() => {
-    return props.ciphers.filter((cipher) => {
+    const next = props.ciphers.filter((cipher) => {
       const isDeleted = !!(cipher.deletedDate || (cipher as any).deletedAt);
       if (sidebarFilter.kind === 'trash') {
         if (!isDeleted) return false;
@@ -444,7 +565,38 @@ export default function VaultPage(props: VaultPageProps) {
       const uri = firstCipherUri(cipher).toLowerCase();
       return name.includes(searchQuery) || username.includes(searchQuery) || uri.includes(searchQuery);
     });
-  }, [props.ciphers, sidebarFilter, searchQuery]);
+
+    next.sort((a, b) => {
+      if (sortMode === 'edited') {
+        const diff = sortTimeValue(b) - sortTimeValue(a);
+        if (diff !== 0) return diff;
+      } else if (sortMode === 'created') {
+        const diff = creationTimeValue(b) - creationTimeValue(a);
+        if (diff !== 0) return diff;
+      } else {
+        const nameDiff = String(a.decName || a.name || '').localeCompare(String(b.decName || b.name || ''), undefined, {
+          sensitivity: 'base',
+          numeric: true,
+        });
+        if (nameDiff !== 0) return nameDiff;
+      }
+
+      return String(a.id || '').localeCompare(String(b.id || ''));
+    });
+
+    return next;
+  }, [props.ciphers, sidebarFilter, searchQuery, sortMode]);
+
+  const sidebarFilterKey = useMemo(() => {
+    if (sidebarFilter.kind === 'folder') return `folder:${sidebarFilter.folderId ?? 'none'}`;
+    if (sidebarFilter.kind === 'type') return `type:${sidebarFilter.value}`;
+    return sidebarFilter.kind;
+  }, [sidebarFilter]);
+
+  useEffect(() => {
+    setListScrollTop(0);
+    listPanelRef.current?.scrollTo({ top: 0 });
+  }, [searchQuery, sortMode, sidebarFilterKey]);
 
   useEffect(() => {
     if (isCreating) return;
@@ -460,6 +612,25 @@ export default function VaultPage(props: VaultPageProps) {
   const selectedCipher = useMemo(
     () => props.ciphers.find((x) => x.id === selectedCipherId) || null,
     [props.ciphers, selectedCipherId]
+  );
+  const virtualRange = useMemo(() => {
+    if (!filteredCiphers.length) {
+      return { start: 0, end: 0, padTop: 0, padBottom: 0 };
+    }
+    const viewport = Math.max(listViewportHeight, VAULT_LIST_ROW_HEIGHT * 8);
+    const visibleCount = Math.ceil(viewport / VAULT_LIST_ROW_HEIGHT);
+    const start = Math.max(0, Math.floor(listScrollTop / VAULT_LIST_ROW_HEIGHT) - VAULT_LIST_OVERSCAN);
+    const end = Math.min(filteredCiphers.length, start + visibleCount + VAULT_LIST_OVERSCAN * 2);
+    return {
+      start,
+      end,
+      padTop: start * VAULT_LIST_ROW_HEIGHT,
+      padBottom: Math.max(0, (filteredCiphers.length - end) * VAULT_LIST_ROW_HEIGHT),
+    };
+  }, [filteredCiphers.length, listScrollTop, listViewportHeight]);
+  const visibleCiphers = useMemo(
+    () => filteredCiphers.slice(virtualRange.start, virtualRange.end),
+    [filteredCiphers, virtualRange.start, virtualRange.end]
   );
   const passkeyCreatedAt = firstPasskeyCreationTime(selectedCipher);
   const selectedAttachments = useMemo(
@@ -504,6 +675,7 @@ export default function VaultPage(props: VaultPageProps) {
     () => Object.values(selectedMap).reduce((sum, v) => sum + (v ? 1 : 0), 0),
     [selectedMap]
   );
+  const totalCipherCount = filteredCiphers.length;
 
 function folderName(id: string | null | undefined): string {
   if (!id) return t('txt_no_folder');
@@ -528,6 +700,8 @@ function folderName(id: string | null | undefined): string {
     setLocalError('');
     setAttachmentQueue([]);
     setRemovedAttachmentIds({});
+    if (isMobileLayout) setMobilePanel('edit');
+    setMobileSidebarOpen(false);
     if (type === 5) void seedSshDefaults();
   }
 
@@ -540,15 +714,19 @@ function folderName(id: string | null | undefined): string {
     setLocalError('');
     setAttachmentQueue([]);
     setRemovedAttachmentIds({});
+    if (isMobileLayout) setMobilePanel('edit');
+    setMobileSidebarOpen(false);
   }
 
   function cancelEdit(): void {
+    const returnToDetail = isMobileLayout && !isCreating && !!selectedCipher;
     setDraft(null);
     setIsEditing(false);
     setIsCreating(false);
     setLocalError('');
     setAttachmentQueue([]);
     setRemovedAttachmentIds({});
+    if (isMobileLayout) setMobilePanel(returnToDetail ? 'detail' : 'list');
   }
 
   function updateDraft(patch: Partial<VaultDraft>): void {
@@ -670,6 +848,7 @@ function folderName(id: string | null | undefined): string {
       setLocalError('');
       setAttachmentQueue([]);
       setRemovedAttachmentIds({});
+      if (isMobileLayout) setMobilePanel('detail');
     } finally {
       setBusy(false);
     }
@@ -682,6 +861,7 @@ function folderName(id: string | null | undefined): string {
       await props.onDelete(pendingDelete);
       setPendingDelete(null);
       cancelEdit();
+      if (isMobileLayout) setMobilePanel('list');
     } finally {
       setBusy(false);
     }
@@ -694,7 +874,11 @@ function folderName(id: string | null | undefined): string {
     if (!ids.length) return;
     setBusy(true);
     try {
-      await props.onBulkDelete(ids);
+      if (sidebarFilter.kind === 'trash') {
+        await props.onBulkPermanentDelete(ids);
+      } else {
+        await props.onBulkDelete(ids);
+      }
       setSelectedMap({});
       setBulkDeleteOpen(false);
     } finally {
@@ -775,10 +959,47 @@ function folderName(id: string | null | undefined): string {
     }
   }
 
+  async function confirmBulkRestore(): Promise<void> {
+    const ids = Object.entries(selectedMap)
+      .filter(([, selected]) => selected)
+      .map(([id]) => id);
+    if (!ids.length) return;
+    setBusy(true);
+    try {
+      await props.onBulkRestore(ids);
+      setSelectedMap({});
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmDeleteAllFolders(): Promise<void> {
+    if (!props.folders.length) return;
+    setBusy(true);
+    try {
+      await props.onBulkDeleteFolders(props.folders.map((folder) => folder.id));
+      if (sidebarFilter.kind === 'folder') {
+        setSidebarFilter({ kind: 'all' });
+      }
+      setDeleteAllFoldersOpen(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
-      <div className="vault-grid">
-        <aside className="sidebar">
+      <div className={`vault-grid ${isMobileLayout ? `mobile-panel-${mobilePanel}` : ''}`}>
+        {isMobileLayout && mobileSidebarOpen && <div className="mobile-sidebar-mask" onClick={() => setMobileSidebarOpen(false)} />}
+        <aside className={`sidebar ${isMobileLayout ? 'mobile-sidebar-sheet' : ''} ${isMobileLayout && mobileSidebarOpen ? 'open' : ''}`}>
+          {isMobileLayout && (
+            <div className="mobile-sidebar-head">
+              <div className="mobile-sidebar-title">{t('txt_folders')}</div>
+              <button type="button" className="mobile-sidebar-close" onClick={() => setMobileSidebarOpen(false)} aria-label={t('txt_close')}>
+                <X size={16} />
+              </button>
+            </div>
+          )}
           <div className="sidebar-block">
             <button type="button" className={`tree-btn ${sidebarFilter.kind === 'all' ? 'active' : ''}`} onClick={() => setSidebarFilter({ kind: 'all' })}>
               <LayoutGrid size={14} className="tree-icon" /> <span className="tree-label">{t('txt_all_items')}</span>
@@ -813,9 +1034,21 @@ function folderName(id: string | null | undefined): string {
           <div className="sidebar-block">
             <div className="sidebar-title-row">
               <div className="sidebar-title">{t('txt_folders')}</div>
-              <button type="button" className="folder-add-btn" onClick={() => setCreateFolderOpen(true)}>
-                <FolderPlus size={14} />
-              </button>
+              <div className="folder-title-actions">
+                <button
+                  type="button"
+                  className="folder-delete-btn"
+                  title={t('txt_delete_all_folders')}
+                  aria-label={t('txt_delete_all_folders')}
+                  disabled={busy || props.folders.length === 0}
+                  onClick={() => setDeleteAllFoldersOpen(true)}
+                >
+                  <X size={14} />
+                </button>
+                <button type="button" className="folder-add-btn" onClick={() => setCreateFolderOpen(true)}>
+                  <FolderPlus size={14} />
+                </button>
+              </div>
             </div>
             <button type="button" className={`tree-btn ${sidebarFilter.kind === 'folder' && sidebarFilter.folderId === null ? 'active' : ''}`} onClick={() => setSidebarFilter({ kind: 'folder', folderId: null })}>
               <FolderX size={14} className="tree-icon" /> <span className="tree-label">{t('txt_no_folder')}</span>
@@ -864,13 +1097,45 @@ function folderName(id: string | null | undefined): string {
                 setSearchInput((e.currentTarget as HTMLInputElement).value);
               }}
             />
-            <button type="button" className="btn btn-secondary small" disabled={busy || props.loading} onClick={() => void syncVault()}>
+            <div className="sort-menu-wrap" ref={sortMenuRef}>
+              <button
+                type="button"
+                className={`btn btn-secondary small sort-trigger ${sortMenuOpen ? 'active' : ''}`}
+                aria-label={t('txt_sort')}
+                title={t('txt_sort')}
+                onClick={() => setSortMenuOpen((open) => !open)}
+              >
+                <ArrowUpDown size={14} className="btn-icon" />
+              </button>
+              {sortMenuOpen && (
+                <div className="sort-menu">
+                  {VAULT_SORT_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`sort-menu-item ${sortMode === option.value ? 'active' : ''}`}
+                      onClick={() => {
+                        setSortMode(option.value);
+                        setSortMenuOpen(false);
+                      }}
+                    >
+                      <span>{option.label}</span>
+                      {sortMode === option.value ? <Check size={14} /> : <span className="sort-menu-check-placeholder" />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="list-count" title={t('txt_total_items_count', { count: totalCipherCount })}>
+              {t('txt_total_items_count', { count: totalCipherCount })}
+            </div>
+            <button type="button" className="btn btn-secondary small list-icon-btn" disabled={busy || props.loading} onClick={() => void syncVault()}>
               <RefreshCw size={14} className="btn-icon" /> {t('txt_sync_vault')}
             </button>
           </div>
           <div className="toolbar actions">
             <button type="button" className="btn btn-danger small" disabled={!selectedCount || busy} onClick={() => setBulkDeleteOpen(true)}>
-              <Trash2 size={14} className="btn-icon" /> {t('txt_delete_selected')}
+              <Trash2 size={14} className="btn-icon" /> {sidebarFilter.kind === 'trash' ? t('txt_delete_permanently') : t('txt_delete_selected')}
             </button>
             <button
               type="button"
@@ -884,9 +1149,15 @@ function folderName(id: string | null | undefined): string {
             >
               <CheckCheck size={14} className="btn-icon" /> {t('txt_select_all')}
             </button>
-            <div className="create-menu-wrap" ref={createMenuRef}>
-              <button type="button" className="btn btn-primary small" onClick={() => setCreateMenuOpen((x) => !x)}>
-                <Plus size={14} className="btn-icon" /> {t('txt_add')}
+            <div className="create-menu-wrap mobile-fab-wrap" ref={createMenuRef}>
+              <button
+                type="button"
+                className="btn btn-primary small mobile-fab-trigger"
+                aria-label={t('txt_add')}
+                title={t('txt_add')}
+                onClick={() => setCreateMenuOpen((x) => !x)}
+              >
+                <Plus size={14} className="btn-icon" />
               </button>
               {createMenuOpen && (
                 <div className="create-menu">
@@ -899,7 +1170,12 @@ function folderName(id: string | null | undefined): string {
                 </div>
               )}
             </div>
-            {selectedCount > 0 && (
+            {selectedCount > 0 && sidebarFilter.kind === 'trash' && (
+              <button type="button" className="btn btn-secondary small" disabled={busy} onClick={() => void confirmBulkRestore()}>
+                <RefreshCw size={14} className="btn-icon" /> {t('txt_restore')}
+              </button>
+            )}
+            {selectedCount > 0 && sidebarFilter.kind !== 'trash' && (
               <button
                 type="button"
                 className="btn btn-secondary small"
@@ -919,8 +1195,14 @@ function folderName(id: string | null | undefined): string {
             )}
           </div>
 
-          <div className="list-panel">
-            {filteredCiphers.map((cipher) => (
+          <div
+            className="list-panel"
+            ref={listPanelRef}
+            onScroll={(event) => setListScrollTop((event.currentTarget as HTMLDivElement).scrollTop)}
+          >
+            {!!filteredCiphers.length && (
+              <div style={{ paddingTop: `${virtualRange.padTop}px`, paddingBottom: `${virtualRange.padBottom}px` }}>
+                {visibleCiphers.map((cipher) => (
               <div key={cipher.id} className={`list-item ${selectedCipherId === cipher.id ? 'active' : ''}`}>
                 <input
                   type="checkbox"
@@ -942,28 +1224,49 @@ function folderName(id: string | null | undefined): string {
                     }
                     setSelectedCipherId(cipher.id);
                     setRepromptApprovedCipherId(null);
+                    if (isMobileLayout) setMobilePanel('detail');
+                    setMobileSidebarOpen(false);
                   }}
                 >
                   <div className="list-icon-wrap">
                     <VaultListIcon cipher={cipher} />
                   </div>
                   <div className="list-text">
-                    <span className="list-title" title={cipher.decName || t('txt_no_name')}>{cipher.decName || t('txt_no_name')}</span>
+                    <span className="list-title" title={cipher.decName || t('txt_no_name')}>
+                      <span className="list-title-text">{cipher.decName || t('txt_no_name')}</span>
+                    </span>
                     <span className="list-sub" title={listSubtitle(cipher)}>{listSubtitle(cipher)}</span>
                   </div>
                 </button>
               </div>
-            ))}
+                ))}
+              </div>
+            )}
             {!filteredCiphers.length && <div className="empty">{t('txt_no_items')}</div>}
           </div>
         </section>
 
-        <section className="detail-col">
+        <section className={`detail-col ${isMobileLayout ? 'mobile-detail-sheet' : ''} ${isMobileLayout && mobilePanel !== 'list' ? 'open' : ''}`}>
+          {isMobileLayout && mobilePanel !== 'list' && (
+            <div className="mobile-panel-head">
+              <button
+                type="button"
+                className="btn btn-secondary small mobile-panel-back"
+                onClick={() => {
+                  if (isEditing) cancelEdit();
+                  else setMobilePanel('list');
+                }}
+              >
+                <ChevronLeft size={14} className="btn-icon" />
+                {t('txt_back')}
+              </button>
+            </div>
+          )}
           {isEditing && draft && (
             <>
               <div className="card">
                 <div className="section-head">
-                  <h3 className="detail-title">{isCreating ? `New ${cipherTypeLabel(draft.type)}` : `Edit ${cipherTypeLabel(draft.type)}`}</h3>
+                  <h3 className="detail-title">{isCreating ? t('txt_new_type_header', { type: cipherTypeLabel(draft.type) }) : t('txt_edit_type_header', { type: cipherTypeLabel(draft.type) })}</h3>
                   <button
                     type="button"
                     className={`btn btn-secondary small ${draft.favorite ? 'star-on' : ''}`}
@@ -1689,8 +1992,12 @@ function folderName(id: string | null | undefined): string {
 
       <ConfirmDialog
         open={bulkDeleteOpen}
-        title={t('txt_delete_selected_items')}
-        message={t('txt_are_you_sure_you_want_to_delete_count_selected_items', { count: selectedCount })}
+        title={sidebarFilter.kind === 'trash' ? t('txt_delete_selected_items_permanently') : t('txt_delete_selected_items')}
+        message={
+          sidebarFilter.kind === 'trash'
+            ? t('txt_are_you_sure_you_want_to_delete_count_selected_items_permanently', { count: selectedCount })
+            : t('txt_are_you_sure_you_want_to_delete_count_selected_items', { count: selectedCount })
+        }
         danger
         onConfirm={() => void confirmBulkDelete()}
         onCancel={() => setBulkDeleteOpen(false)}
@@ -1738,13 +2045,24 @@ function folderName(id: string | null | undefined): string {
 
       <ConfirmDialog
         open={!!pendingDeleteFolder}
-        title={`${t('txt_delete')} ${t('txt_folder')}`}
-        message={`Delete folder "${pendingDeleteFolder?.decName || pendingDeleteFolder?.name || pendingDeleteFolder?.id || ''}"? Items inside will move to ${t('txt_no_folder')}.`}
+        title={t('txt_delete_folder')}
+        message={t('txt_delete_folder_message', { name: pendingDeleteFolder?.decName || pendingDeleteFolder?.name || pendingDeleteFolder?.id || '' })}
         confirmText={t('txt_delete')}
         cancelText={t('txt_cancel')}
         danger
         onConfirm={() => void confirmDeleteFolder()}
         onCancel={() => setPendingDeleteFolder(null)}
+      />
+
+      <ConfirmDialog
+        open={deleteAllFoldersOpen}
+        title={t('txt_delete_all_folders')}
+        message={t('txt_delete_all_folders_message')}
+        confirmText={t('txt_delete')}
+        cancelText={t('txt_cancel')}
+        danger
+        onConfirm={() => void confirmDeleteAllFolders()}
+        onCancel={() => setDeleteAllFoldersOpen(false)}
       />
 
       <ConfirmDialog
