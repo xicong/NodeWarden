@@ -1,9 +1,11 @@
 import { Env, Cipher, Folder, CipherType } from '../types';
+import { notifyUserVaultSync } from '../durable/notifications-hub';
 import { StorageService } from '../services/storage';
 import { errorResponse, jsonResponse } from '../utils/response';
+import { readActingDeviceIdentifier } from '../utils/device';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
-import { normalizeCipherLoginForCompatibility, normalizeCipherSshKeyForCompatibility } from './ciphers';
+import { normalizeCipherLoginForStorage, normalizeCipherSshKeyForCompatibility } from './ciphers';
 
 // Bitwarden client import request format
 interface CiphersImportRequest {
@@ -230,9 +232,10 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
       key: (c as any).key ?? null,
       createdAt: now,
       updatedAt: now,
+      archivedAt: null,
       deletedAt: null,
     };
-    cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+    cipher.login = normalizeCipherLoginForStorage(cipher.login);
 
     cipherRows.push(cipher);
     cipherMapRows.push({ index: i, sourceId, id: cipher.id });
@@ -243,10 +246,10 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
       const data = JSON.stringify(cipher);
       return env.DB
         .prepare(
-          'INSERT INTO ciphers(id, user_id, type, folder_id, name, notes, favorite, data, reprompt, key, created_at, updated_at, deleted_at) ' +
-          'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+          'INSERT INTO ciphers(id, user_id, type, folder_id, name, notes, favorite, data, reprompt, key, created_at, updated_at, archived_at, deleted_at) ' +
+          'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
           'ON CONFLICT(id) DO UPDATE SET ' +
-          'user_id=excluded.user_id, type=excluded.type, folder_id=excluded.folder_id, name=excluded.name, notes=excluded.notes, favorite=excluded.favorite, data=excluded.data, reprompt=excluded.reprompt, key=excluded.key, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at'
+          'user_id=excluded.user_id, type=excluded.type, folder_id=excluded.folder_id, name=excluded.name, notes=excluded.notes, favorite=excluded.favorite, data=excluded.data, reprompt=excluded.reprompt, key=excluded.key, updated_at=excluded.updated_at, archived_at=excluded.archived_at, deleted_at=excluded.deleted_at'
         )
         .bind(
           cipher.id,
@@ -261,6 +264,7 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
           bindNull(cipher.key),
           cipher.createdAt,
           cipher.updatedAt,
+          bindNull(cipher.archivedAt),
           bindNull(cipher.deletedAt)
         );
     });
@@ -268,7 +272,8 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
   }
 
   // Update revision date
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  await notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
 
   if (returnCipherMap) {
     return jsonResponse({
